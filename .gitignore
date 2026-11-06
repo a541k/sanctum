@@ -1,0 +1,40 @@
+# --- Your journal data: never commit this ---
+# The vault normally lives outside the project (~/JournalVault), but these
+# patterns protect you if you ever point --vault at a folder inside the repo.
+vault.json
+entries/
+*.enc
+journal-backup-*.zip
+
+# --- Secrets for the future Google Drive sync ---
+credentials.json
+client_secret*.json
+token.json
+token.pickle
+.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Packaging (PyInstaller) ---
+build/
+dist/
+*.spec
+
+# --- Editors and OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
