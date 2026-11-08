@@ -122,10 +122,10 @@ class MainWindow(QMainWindow):
     def lock(self) -> None:
         if not self.current.can_leave():
             return
-        self.vault.lock()
         self.entry.editor.clear()
         self.history.clear()
-        self.navigate(self.home, push=False)
+        self.navigate(self.home, push=False)  # before vault.lock(): Home reads the vault when shown
+        self.vault.lock()
         self.hide()
         vault = authenticate(self.config.vault_path)
         if vault is None:

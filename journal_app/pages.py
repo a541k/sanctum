@@ -43,6 +43,10 @@ def _relative_day(iso: str) -> str:
     return f"on {d.day} {d:%B %Y}"
 
 
+def _entries(n: int) -> str:
+    return f"{n} {'entry' if n == 1 else 'entries'}"
+
+
 # --------------------------------------------------------------------------
 class HomePage(Page):
     def __init__(self, win):
@@ -404,6 +408,14 @@ class SettingsPage(Page):
         export_btn.clicked.connect(self.export_backup)
         self.backup_desc = bak.add_row(
             "Export a backup", self.BACKUP_TEXT + " No backup yet.", export_btn)
+        files_btn = make_button("From files…")
+        files_btn.clicked.connect(self.restore_from_files)
+        folder_btn = make_button("From a folder…")
+        folder_btn.clicked.connect(self.restore_from_folder)
+        bak.add_row("Restore from a backup",
+                    "Bring back entries from backup .zip files or a folder. "
+                    "Nothing is deleted, and the newer copy of an entry is kept.",
+                    files_btn, folder_btn)
         cloud_btn = make_button("Coming soon", icon="cloud")
         cloud_btn.setEnabled(False)
         bak.add_row("Google Drive sync", "Keep an encrypted copy of your journal in your own Google Drive.", cloud_btn)
@@ -462,7 +474,7 @@ class SettingsPage(Page):
             QMessageBox.information(self, "Password changed", "Your password has been changed.")
 
     def export_backup(self) -> None:
-        default = f"journal-backup-{date.today().isoformat()}.zip"
+        default = f"journal-backup-{datetime.now():%Y-%m-%d_%H%M}.zip"  # a new backup never replaces an old one
         path, _ = QFileDialog.getSaveFileName(self, "Export backup", str(self.win.config.vault_path.parent / default),
                                               "Zip archive (*.zip)")
         if not path:
@@ -476,6 +488,58 @@ class SettingsPage(Page):
         self.win.config.save()
         self.on_show()
         QMessageBox.information(self, "Backup saved", f"Saved {n} {'entry' if n == 1 else 'entries'} to:\n{path}")
+
+    def restore_from_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Choose backup files", str(self.win.config.vault_path.parent),
+                                                "Journal backups (*.zip *.enc)")
+        if paths:
+            self._restore(paths)
+
+    def restore_from_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder with backup files",
+                                                  str(self.win.config.vault_path.parent))
+        if folder:
+            self._restore([folder])
+
+    def _restore(self, sources: list[str]) -> None:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            plan = self.win.vault.scan_backups(sources)
+        except ValueError as ex:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Couldn't restore", str(ex))
+            return
+        QApplication.restoreOverrideCursor()
+        unreadable = (f"\n\n{plan.unreadable} {'file' if plan.unreadable == 1 else 'files'} couldn't be read. "
+                      "They are damaged or belong to a different journal." if plan.unreadable else "")
+        if not plan.found:
+            QMessageBox.warning(self, "Nothing to restore",
+                                ("These files couldn't be read. They are damaged or belong to a different journal."
+                                 if plan.unreadable else "No journal entries were found there.")
+                                + "\n\nNothing was added.")
+            return
+        if not (plan.new or plan.newer):
+            QMessageBox.information(self, "Nothing to restore",
+                                    "Everything in this backup is already in your journal." + unreadable)
+            return
+        summary = (f"Found {_entries(plan.found)}:\n\n"
+                   f"•  {len(plan.new)} you don't have yet\n"
+                   f"•  {len(plan.newer)} newer than your copy\n"
+                   f"•  {plan.same} you already have{unreadable}\n\n"
+                   "Add them to your journal? Nothing in your journal will be deleted.")
+        if not self._confirm_restore(summary):
+            return
+        self.win.vault.apply_import(plan)
+        QMessageBox.information(self, "Backup restored",
+                                f"Added {_entries(len(plan.new))} and updated {len(plan.newer)}.")
+
+    def _confirm_restore(self, text: str) -> bool:
+        box = QMessageBox(QMessageBox.Icon.Question, "Restore from a backup", text, parent=self)
+        add = box.addButton("Add entries", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(add)
+        box.exec()
+        return box.clickedButton() is add
 
     def open_folder(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.win.vault.root)))

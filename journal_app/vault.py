@@ -32,6 +32,11 @@ FORMAT_VERSION = 1
 WRAP_AAD = b"journal-master-key-v1"
 ENTRY_AAD = b"journal-entry-v1"
 
+# Restore reads backups in memory, so it refuses anything a real journal would never contain.
+MAX_IMPORT_FILE_SIZE = 50 * 1024 * 1024  # bytes, per entry file
+MAX_IMPORT_FILES = 100_000
+MAX_IMPORT_BYTES = 2 * 1024 ** 3         # bytes, all files together
+
 
 class InvalidCredentials(Exception):
     pass
@@ -74,6 +79,10 @@ class Entry:
         return datetime.fromisoformat(self.created_at)
 
     @property
+    def updated(self) -> datetime:
+        return datetime.fromisoformat(self.updated_at)
+
+    @property
     def date(self) -> str:
         return self.created_at[:10]
 
@@ -101,8 +110,21 @@ class Summary(NamedTuple):
         return datetime.fromisoformat(self.created_at)
 
 
+@dataclass
+class ImportPlan:
+    """What a restore would change. Built by Vault.scan_backups, applied by Vault.apply_import."""
+    new: list = field(default_factory=list)    # (Entry, encrypted file) not in the journal yet
+    newer: list = field(default_factory=list)  # (Entry, encrypted file) newer than the journal's copy
+    same: int = 0                              # already in the journal (same or newer copy)
+    unreadable: int = 0                        # damaged, too large, or from a different journal
+
+    @property
+    def found(self) -> int:
+        return len(self.new) + len(self.newer) + self.same
+
+
 SCHEMA = """
-CREATE TABLE entries (id TEXT PRIMARY KEY, path TEXT, created_at TEXT, date TEXT,
+CREATE TABLE entries (id TEXT PRIMARY KEY, path TEXT, created_at TEXT, updated_at TEXT, date TEXT,
                       title TEXT, tags TEXT, preview TEXT);
 CREATE TABLE tags (entry_id TEXT, tag TEXT);
 CREATE INDEX idx_date ON entries(date);
@@ -126,6 +148,40 @@ def make_preview(markdown: str, limit: int = 160) -> str:
 
 def _b64(b: bytes) -> str:
     return base64.b64encode(b).decode()
+
+
+def _backup_blobs(sources):
+    """Yield the bytes of every .enc file in the given zips, folders and loose files, whatever their names.
+
+    Yields None for a file that can't be read or is too large to be a journal entry.
+    """
+    for src in map(Path, sources):
+        if src.is_dir() or src.suffix.lower() == ".enc":
+            for p in sorted(src.rglob("*.enc")) if src.is_dir() else [src]:
+                try:
+                    yield p.read_bytes() if p.stat().st_size <= MAX_IMPORT_FILE_SIZE else None
+                except OSError:
+                    yield None
+            continue
+        try:
+            z = zipfile.ZipFile(src)
+        except (OSError, zipfile.BadZipFile):
+            yield None
+            continue
+        with z:  # members are read in memory, never extracted to disk
+            for info in z.infolist():
+                if info.is_dir() or not info.filename.lower().endswith(".enc"):
+                    continue
+                if info.file_size > MAX_IMPORT_FILE_SIZE:
+                    yield None
+                    continue
+                try:  # read with a hard limit: z.read() trusts the header and would unpack a lying zip in full
+                    with z.open(info) as f:
+                        blob = f.read(MAX_IMPORT_FILE_SIZE + 1)
+                except Exception:  # bad CRC, unsupported compression, password-protected zip...
+                    yield None
+                    continue
+                yield blob if len(blob) <= MAX_IMPORT_FILE_SIZE else None
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
@@ -184,6 +240,7 @@ class Vault:
         self._key: bytes | None = master_key
         self._meta = meta
         self.load_errors: list[str] = []
+        self._extra: dict[str, list[str]] = {}  # entry id -> older copies of the same entry on disk
         self._db = sqlite3.connect(":memory:")
         self._db.executescript(SCHEMA)
         self._load_index()
@@ -216,8 +273,8 @@ class Vault:
         rel = path.relative_to(self.root).as_posix()
         self._db.execute("DELETE FROM entries WHERE id=?", (e.id,))
         self._db.execute("DELETE FROM tags WHERE entry_id=?", (e.id,))
-        self._db.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?)",
-                         (e.id, rel, e.created_at, e.date, e.title, json.dumps(e.tags),
+        self._db.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?)",
+                         (e.id, rel, e.created_at, e.updated_at, e.date, e.title, json.dumps(e.tags),
                           make_preview(e.content)))
         self._db.executemany("INSERT INTO tags VALUES (?,?)", [(e.id, t) for t in e.tags])
         self._db.commit()
@@ -226,17 +283,38 @@ class Vault:
         for p in sorted((self.root / "entries").glob("**/*.enc")):
             try:
                 e = Entry.from_bytes(crypto.decrypt(self._key, p.read_bytes(), ENTRY_AAD))
-                self._index(e, p)
             except Exception as ex:  # corrupt file shouldn't block the whole journal
                 self.load_errors.append(f"{p.name}: {ex}")
+                continue
+            row = self._db.execute("SELECT path, updated_at FROM entries WHERE id=?", (e.id,)).fetchone()
+            if row:  # the same entry twice (e.g. copied in by hand): index the newest, remember the other
+                if datetime.fromisoformat(row[1]) >= e.updated:
+                    self._extra.setdefault(e.id, []).append(p.relative_to(self.root).as_posix())
+                    continue
+                self._extra.setdefault(e.id, []).append(row[0])
+            self._index(e, p)
+
+    def _updated_of(self, entry_id: str) -> datetime | None:
+        row = self._db.execute("SELECT updated_at FROM entries WHERE id=?", (entry_id,)).fetchone()
+        return datetime.fromisoformat(row[0]) if row else None
+
+    def _put(self, e: Entry, blob: bytes) -> None:
+        """Write an entry's encrypted file, index it, then remove any older copies of the same entry."""
+        path = self._entry_path(e)
+        _write_atomic(path, blob)
+        row = self._db.execute("SELECT path FROM entries WHERE id=?", (e.id,)).fetchone()
+        old = self._extra.pop(e.id, []) + ([row[0]] if row else [])
+        self._index(e, path)
+        rel = path.relative_to(self.root).as_posix()
+        for p in old:
+            if p != rel:
+                (self.root / p).unlink(missing_ok=True)
 
     def save_entry(self, e: Entry) -> Entry:
         self._require_unlocked()
         e.tags = normalize_tags(e.tags)
         e.updated_at = datetime.now().astimezone().replace(microsecond=0).isoformat()
-        path = self._entry_path(e)
-        _write_atomic(path, crypto.encrypt(self._key, e.to_bytes(), ENTRY_AAD))
-        self._index(e, path)
+        self._put(e, crypto.encrypt(self._key, e.to_bytes(), ENTRY_AAD))
         return e
 
     def get_entry(self, entry_id: str) -> Entry:
@@ -250,8 +328,8 @@ class Vault:
     def delete_entry(self, entry_id: str) -> None:
         self._require_unlocked()
         row = self._db.execute("SELECT path FROM entries WHERE id=?", (entry_id,)).fetchone()
-        if row:
-            (self.root / row[0]).unlink(missing_ok=True)
+        for rel in ([row[0]] if row else []) + self._extra.pop(entry_id, []):
+            (self.root / rel).unlink(missing_ok=True)
         self._db.execute("DELETE FROM entries WHERE id=?", (entry_id,))
         self._db.execute("DELETE FROM tags WHERE entry_id=?", (entry_id,))
         self._db.commit()
@@ -317,6 +395,50 @@ class Vault:
                 z.write(f, arcname=f.relative_to(self.root).as_posix())
         os.replace(tmp, dest)
         return len(files) - 1
+
+    def scan_backups(self, sources) -> ImportPlan:
+        """Read backups (zips, folders or .enc files) and work out what restoring them would change.
+
+        Only files encrypted with this journal's key count; anything else is unreadable. File names
+        are ignored: an entry is known by the id inside it, and of several copies the newest wins.
+        Nothing is written.
+        """
+        self._require_unlocked()
+        plan = ImportPlan()
+        best: dict[str, tuple[Entry, bytes]] = {}
+        total = 0
+        for n, blob in enumerate(_backup_blobs(sources), 1):
+            total += len(blob or b"")
+            if n > MAX_IMPORT_FILES or total > MAX_IMPORT_BYTES:
+                raise ValueError("That's more than a journal backup would hold. Nothing was added.")
+            try:
+                e = Entry.from_bytes(crypto.decrypt(self._key, blob, ENTRY_AAD)) if blob is not None else None
+            except Exception:
+                e = None
+            if e is None:
+                plan.unreadable += 1
+            elif e.id not in best or e.updated > best[e.id][0].updated:
+                best[e.id] = (e, blob)
+        for e, blob in best.values():
+            mine = self._updated_of(e.id)
+            if mine is None:
+                plan.new.append((e, blob))
+            elif e.updated > mine:
+                plan.newer.append((e, blob))
+            else:
+                plan.same += 1
+        return plan
+
+    def apply_import(self, plan: ImportPlan) -> int:
+        """Copy the new and newer entries of a scan into the journal. Never deletes. Returns how many were written."""
+        self._require_unlocked()
+        written = 0
+        for e, blob in plan.new + plan.newer:
+            mine = self._updated_of(e.id)
+            if mine is None or e.updated > mine:  # still newer: the journal may have changed since the scan
+                self._put(e, blob)  # the file is already encrypted with this journal's key
+                written += 1
+        return written
 
     def move_to(self, new_root) -> int:
         """Copy the vault to an empty folder, verify every file, switch over, then remove the old copy.

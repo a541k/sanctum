@@ -1,4 +1,5 @@
 import os
+import re
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
@@ -122,10 +123,48 @@ def test_settings_export(win, tmp_path, monkeypatch):
     from journal_app import pages
     win.vault.save_entry(Entry.new())
     out = tmp_path / "b.zip"
-    monkeypatch.setattr(pages.QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
+    suggested = []
+    monkeypatch.setattr(pages.QFileDialog, "getSaveFileName", lambda *a, **k: suggested.append(a[2]) or (str(out), ""))
     monkeypatch.setattr(pages.QMessageBox, "information", lambda *a, **k: None)
     win.show_settings(); win.settings.export_backup()
     assert out.exists() and "Last backup:" in win.settings.backup_desc.text()
+    assert re.search(r"journal-backup-\d{4}-\d\d-\d\d_\d{4}\.zip$", suggested[0])   # date and time
+
+
+def test_settings_restore(win, tmp_path, monkeypatch):
+    from journal_app import pages
+    e = win.vault.save_entry(Entry.new())
+    out = tmp_path / "b.zip"
+    win.vault.export_backup(out)
+    win.vault.delete_entry(e.id)
+    monkeypatch.setattr(pages.QFileDialog, "getOpenFileNames", lambda *a, **k: ([str(out)], ""))
+    infos, asked = [], []
+    monkeypatch.setattr(pages.QMessageBox, "information", lambda *a, **k: infos.append(a[2]))
+    monkeypatch.setattr(win.settings, "_confirm_restore", lambda text: asked.append(text) or True)
+    win.show_settings(); win.settings.restore_from_files()
+    assert win.vault.entry_count() == 1 and "1 you don't have yet" in asked[0] and "Added 1 entry" in infos[-1]
+    win.settings.restore_from_files()                                  # second time: nothing left to add
+    assert len(asked) == 1 and "already in your journal" in infos[-1]
+
+
+def test_lock_and_unlock(win, monkeypatch):
+    from journal_app import main_window
+    old = win.vault
+    e = old.save_entry(Entry.new())
+    win.show_browse(2); win.open_entry(e.id)
+    monkeypatch.setattr(main_window, "authenticate", lambda root: Vault.open(root, password="password123"))
+    win.lock()
+    assert old._key is None and win.vault is not old and win.vault.entry_count() == 1
+    assert win.current is win.home and not win.history and win.isVisible()
+
+
+def test_lock_then_cancel_quits(win, monkeypatch):
+    from journal_app import main_window
+    quits = []
+    monkeypatch.setattr(main_window, "authenticate", lambda root: None)
+    monkeypatch.setattr(main_window.QApplication, "quit", lambda: quits.append(1))
+    win.show(); win.lock()
+    assert quits and win.vault._key is None and not win.isVisible()
 
 
 # ---- dialogs -----------------------------------------------------------------
